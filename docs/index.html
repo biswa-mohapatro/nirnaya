@@ -1,0 +1,707 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="How I built Nirnaya-Flash, a 421M-parameter calibrated decision model on one personal laptop, and what 46 experiments taught me about data, forgetting, calibration and inference.">
+  <meta name="theme-color" content="#f4f1ea">
+  <meta name="author" content="Biswajit Mohapatro">
+  <meta property="og:type" content="article">
+  <meta property="article:author" content="Biswajit Mohapatro">
+  <meta property="og:title" content="Training a 421M Decision Model on One Laptop">
+  <meta property="og:description" content="46 experiments, failures, and a reproducible recipe for training a calibrated decision model on modest hardware.">
+  <title>Training a 421M Decision Model on One Laptop — Nirnaya-Flash</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#article">Skip to article</a>
+  <div class="progress" aria-hidden="true"><div></div></div>
+
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="#top">Nirnaya-Flash · Technical Readout</a>
+      <div class="header-actions">
+        <a class="icon-btn" href="#reproduce" aria-label="Jump to reproduction section">↘ Reproduce</a>
+        <button class="icon-btn" type="button" data-theme-toggle aria-label="Switch color theme">◐</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="layout" id="top">
+    <nav class="side-nav" aria-label="Article timeline">
+      <div class="eyebrow">Reading timeline</div>
+      <ol>
+        <li><a class="active" href="#intro">The premise</a></li>
+        <li><a href="#decision-model">Decision model</a></li>
+        <li><a href="#objective">What I optimized</a></li>
+        <li><a href="#architecture">Architecture</a></li>
+        <li><a href="#adaptation">1 · Adaptation depth</a></li>
+        <li><a href="#transfer">2 · Transfer gap</a></li>
+        <li><a href="#forgetting">3 · Forgetting</a></li>
+        <li><a href="#measurement">4 · Measurement noise</a></li>
+        <li><a href="#discipline">5 · Experiment discipline</a></li>
+        <li><a href="#diagnostics">6 · Diagnostics</a></li>
+        <li><a href="#joint">7 · Joint mixing</a></li>
+        <li><a href="#objectives">8 · Failed objectives</a></li>
+        <li><a href="#plateau">9 · The plateau</a></li>
+        <li><a href="#nli">10 · NLI hypothesis</a></li>
+        <li><a href="#specialization">11 · Specialization</a></li>
+        <li><a href="#licensing">12 · Licensing</a></li>
+        <li><a href="#recipe">Final recipe</a></li>
+        <li><a href="#calibration">Calibration</a></li>
+        <li><a href="#results">Sealed results</a></li>
+        <li><a href="#inference">Inference</a></li>
+        <li><a href="#limits">Limits & ceiling</a></li>
+        <li><a href="#lessons">What I learned</a></li>
+        <li><a href="#reproduce">Reproduce</a></li>
+      </ol>
+    </nav>
+
+    <article id="article">
+      <div class="mobile-toc">
+        <details>
+          <summary>Jump to a section</summary>
+          <a href="#decision-model">Decision model</a>
+          <a href="#architecture">Architecture</a>
+          <a href="#forgetting">Catastrophic forgetting</a>
+          <a href="#measurement">Measurement noise</a>
+          <a href="#joint">Joint curriculum</a>
+          <a href="#objectives">Failed objectives</a>
+          <a href="#recipe">Final recipe</a>
+          <a href="#calibration">Calibration</a>
+          <a href="#results">Results</a>
+          <a href="#lessons">What I learned</a>
+        </details>
+      </div>
+
+      <header class="hero" id="intro">
+        <div class="eyebrow">Independent ML engineering · 46 training runs · one personal laptop</div>
+        <h1>Training a 421M Decision Model on One Laptop</h1>
+        <p class="deck">How I built Nirnaya-Flash from a pretrained ModernBERT encoder, what failed along the way, and what 46 experiments taught me about data composition, catastrophic forgetting, measurement noise, calibration, and inference engineering.</p>
+        <div class="byline">
+          <span>Built on Apple M5 Pro · 24 GB unified memory</span>
+          <span>MLX + PyTorch</span>
+          <span>Apache-2.0 release</span>
+        </div>
+      </header>
+
+      <div class="lede">
+        <p><strong>I built this model alone, on my personal laptop.</strong> There was no training cluster, dedicated research team, or large experimental budget behind it.</p>
+        <p>Most of the project came from continuously reading open-source implementations, papers, model documentation, training recipes, benchmark code, and prior work—then testing which of those ideas actually transferred to the problem in front of me.</p>
+      </div>
+
+      <div class="kpis" aria-label="Key outcomes">
+        <div class="kpi"><b>77.1%</b><span>sealed-test accuracy</span></div>
+        <div class="kpi"><b>0.054</b><span>calibrated ECE</span></div>
+        <div class="kpi"><b>98.6%</b><span>accuracy at confidence ≥ 0.90</span></div>
+        <div class="kpi"><b>10.1 ms</b><span>P50, one question</span></div>
+      </div>
+
+      <p>Training the model was not the hardest part. The harder part was figuring out <strong>why one run was genuinely better than another</strong>.</p>
+      <p>Across 46 experiments, I tried partial fine-tuning, sequential curricula, joint training, specialist stages, different objectives, multiple random seeds, probability calibration, and several approaches to preserving capabilities during full fine-tuning. Some ideas worked. Several reasonable ideas failed badly. And some apparent improvements disappeared once I looked more carefully at variance and measurement resolution.</p>
+
+      <blockquote>If the evaluation cannot resolve the size of an improvement, the improvement is not evidence.</blockquote>
+
+      <section id="decision-model">
+        <div class="eyebrow">Problem framing</div>
+        <h2>First: what exactly is a decision model?</h2>
+        <p>Most language-model APIs generate text. But many production systems eventually need something much simpler: <strong>make a constrained decision</strong>.</p>
+
+        <pre><code>{
+  "state": "Checkout has been failing for every customer for the last hour.",
+  "questions": {
+    "team": {
+      "type": "choice",
+      "instructions": "Which team should handle this?",
+      "criteria": {
+        "billing": "Payments",
+        "technical": "Outages and errors",
+        "sales": "Plans"
+      }
+    },
+    "urgent": {
+      "type": "noul",
+      "instructions": "Is this urgent?"
+    }
+  }
+}</code></pre>
+
+        <p>For <code>team</code>, I do not need a generated explanation. I want a bounded distribution:</p>
+        <pre><code>billing      0.01
+technical    0.98
+sales        0.01</code></pre>
+
+        <figure class="figure">
+          <div class="diagram-title">Decision model vs. generative response</div>
+          <div class="compare">
+            <div class="panel">
+              <strong>Generative path</strong>
+              <p>Prompt → decode tokens → parse answer → validate schema → retry if malformed.</p>
+            </div>
+            <div class="mid">vs</div>
+            <div class="panel">
+              <strong>Decision path</strong>
+              <p>State + question + candidates → one forward pass → candidate scores → probabilities.</p>
+            </div>
+          </div>
+          <figcaption>The output space is constrained before inference, so there is no free-form decoding loop.</figcaption>
+        </figure>
+
+        <p>Nirnaya-Flash supports three primitives: <strong>Choice</strong> for one-of-N decisions, <strong>Noul</strong> for binary yes/no decisions, and <strong>Score</strong> for ordinal scales. Probability is part of the interface rather than metadata added afterward.</p>
+      </section>
+
+      <section id="objective">
+        <div class="eyebrow">Evaluation contract</div>
+        <h2>What I was optimizing</h2>
+        <p>Accuracy was necessary, but not sufficient. For the workload I had in mind, I wanted four properties to hold at the same time:</p>
+        <ul>
+          <li><strong>Accuracy</strong> — the correct answer should win.</li>
+          <li><strong>Calibrated confidence</strong> — a 0.9 probability should mean something operationally.</li>
+          <li><strong>Option-order robustness</strong> — reordering candidates should not arbitrarily change the answer.</li>
+          <li><strong>Low, predictable latency</strong> — this model is intended for synchronous decision paths.</li>
+        </ul>
+        <pre><code>accuracy       argmax prediction equals gold label
+ECE            expected calibration error, 15 bins
+hard Brier     sum over classes of (p_k - y_k)^2
+teacher Brier  Brier score against reference distribution
+flip rate      Choice argmax changes when options are permuted
+coverage@0.90  share answered with confidence >= 0.90,
+               always paired with accuracy on that subset</code></pre>
+
+        <p>The target corpus was split by role rather than convenience.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Split</th><th>Cases</th><th>Decisions</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td>Train</td><td>900</td><td>4,500</td><td>Model training</td></tr>
+            <tr><td>TD-DEV</td><td>180</td><td>900</td><td>Reusable research selection</td></tr>
+            <tr><td>TD-CAL</td><td>60</td><td>300</td><td>Calibration only</td></tr>
+            <tr><td>Sealed test</td><td>400</td><td>2,000</td><td>One confirmatory evaluation</td></tr>
+          </tbody>
+        </table></div>
+
+        <p>I used Open-Jev, Banking77, BoolQ, and UltraFeedback as foundation sources, then GoEmotions, News Category, and prompt-injection examples in the specialist stage. Every build was deterministic, leakage-checked, and SHA-256 bound to its run so that a changed metric could be traced back to a changed artifact.</p>
+      </section>
+
+      <section id="architecture">
+        <div class="eyebrow">Model design</div>
+        <h2>The architecture</h2>
+        <p>Nirnaya-Flash starts from a pretrained <strong>ModernBERT-large</strong> backbone. I did not pretrain a language model from random initialization; I adapted a pinned open-source encoder and trained newly initialized decision layers around it.</p>
+
+        <figure class="figure">
+          <div class="diagram-title">How one question is scored</div>
+          <div class="flow">
+            <div class="node"><b>State</b><small>Business record, trace, incident, or other evidence.</small></div>
+            <div class="node"><b>Typed question</b><small>Choice, Noul, or Score instructions.</small></div>
+            <div class="node"><b>Candidate markers</b><small>Each option is rendered with a scoring marker.</small></div>
+            <div class="node"><b>Bidirectional encoder</b><small>Every option can attend to state, question, and competitors.</small></div>
+            <div class="node"><b>Softmax</b><small>Marker scores become a probability distribution.</small></div>
+          </div>
+          <figcaption>One forward pass produces the distribution. There is no autoregressive decoding.</figcaption>
+        </figure>
+
+        <p>The model has four parts: the ModernBERT backbone, a primitive embedding, two pre-norm decision-transformer layers with GELU, and a shared marker head that scores each candidate's hidden state.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Property</th><th>Value</th></tr></thead>
+          <tbody>
+            <tr><td>Parameters</td><td>421M</td></tr>
+            <tr><td>Context limit</td><td>512 tokens</td></tr>
+            <tr><td>Question/options reservation</td><td>Up to 192 tokens</td></tr>
+            <tr><td>Inference precision</td><td>float16</td></tr>
+            <tr><td>Weight size</td><td>~0.8 GB</td></tr>
+            <tr><td>Peak inference memory</td><td>~1.9–2.6 GB</td></tr>
+          </tbody>
+        </table></div>
+        <div class="callout"><p><strong>The trade-off:</strong> this model is a strong classifier over request-time schemas. It is not intended to be a general-purpose reasoning model.</p></div>
+      </section>
+
+      <section id="adaptation">
+        <div class="eyebrow">Experiment 1</div>
+        <h2>How much of the encoder should I fine-tune?</h2>
+        <p>Open-source fine-tuning work gives you many plausible choices: train only the head, unfreeze a few top layers, unfreeze more of the backbone, or fully fine-tune. I tested all four from the same pretrained starting point.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Trainable component</th><th>Parameters</th><th>Primitive macro score</th><th>Noul macro F1</th></tr></thead>
+          <tbody>
+            <tr><td>Head only</td><td>28M</td><td>0.643</td><td>0.391</td></tr>
+            <tr><td>Top 4 layers</td><td>77M</td><td>0.705</td><td>0.448</td></tr>
+            <tr><td>Top 8 layers</td><td>126M</td><td>0.787</td><td>0.594</td></tr>
+            <tr><td><strong>Full encoder</strong></td><td>423M</td><td><strong>0.890</strong></td><td><strong>0.791</strong></td></tr>
+          </tbody>
+        </table></div>
+
+        <p>Full adaptation won on every metric. The largest jump was yes/no: Noul macro F1 nearly doubled from 0.391 to 0.791. For this problem, the representation itself needed to move.</p>
+
+        <h3>Making full fine-tuning practical</h3>
+        <p>On a 24 GB M5 Pro, memory and step time immediately became first-class constraints. I compiled the forward pass, backward pass, clipping, and AdamW update into one MLX graph.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Metric</th><th>Before</th><th>After</th></tr></thead>
+          <tbody><tr><td>Step time</td><td>0.354 s</td><td><strong>0.156 s</strong></td></tr><tr><td>Peak memory</td><td>12.89 GB</td><td><strong>8.30 GB</strong></td></tr></tbody>
+        </table></div>
+        <p>I also measured sequence lengths rather than guessing. <strong>99.25% of rows fit inside 384 tokens.</strong> A 4,096-token budget peaked at 22.8 GB and collapsed throughput, while the smaller measured budget stayed comfortably within the machine.</p>
+        <blockquote>Measure the actual sequence-length distribution before deciding how much context to allocate.</blockquote>
+      </section>
+
+      <section id="transfer">
+        <div class="eyebrow">Experiment 2</div>
+        <h2>Benchmark performance did not transfer</h2>
+        <p>Early checkpoints reached roughly <strong>98–99%</strong> on Banking77 validation and around <strong>80%</strong> on BoolQ. A model from the same training family reached only <strong>32.7%</strong> on real workflow decisions.</p>
+        <p>That gap reset my assumptions. The public datasets were useful as supporting skills, but they were not good proxies for the target distribution. From this point onward, the target task drove selection.</p>
+      </section>
+
+      <section id="forgetting">
+        <div class="eyebrow">Experiment 3</div>
+        <h2>My biggest gain also destroyed the model</h2>
+        <p>The next curriculum was sequential: foundation skills first, then Open-Jev, then specialist data. It sounded reasonable. It also produced one of the most useful failures in the entire project.</p>
+
+        <figure class="figure">
+          <div class="diagram-title">Sequential training: local gain, global loss</div>
+          <div class="compare">
+            <div class="panel">
+              <strong>Before broad stage</strong>
+              <p>Banking77 0.984<br>BoolQ 0.783<br>UltraFeedback 0.462</p>
+            </div>
+            <div class="mid">→</div>
+            <div class="panel">
+              <strong>After broad stage</strong>
+              <p>Banking77 0.798<br>BoolQ <strong>0.451</strong><br>UltraFeedback 0.351</p>
+            </div>
+          </div>
+          <figcaption>At the same time, Open-Jev validation jumped from 0.295 to 0.792. The new capability improved while earlier ones were erased.</figcaption>
+        </figure>
+
+        <p>With full fine-tuning and no replay, the optimizer has no reason to preserve a distribution that disappears from the gradient stream. The specialist stage inherited that damage and reached only 0.720 on its validation role.</p>
+        <blockquote>If the final model needs several capabilities, those capabilities must remain visible during optimization.</blockquote>
+      </section>
+
+      <section id="measurement">
+        <div class="eyebrow">Experiment 4</div>
+        <h2>A 0.67-point “improvement” that was not actually an improvement</h2>
+        <p>Two specialist recipes differed by <strong>0.67 percentage points</strong> on 900 validation decisions. The obvious temptation was to declare a winner.</p>
+        <p>But the 900 decisions came from only 180 cases, with five correlated decisions per case. Treating the rows as independent would make the confidence interval too optimistic.</p>
+        <pre><code>SE = sqrt(p(1 - p) / n)
+     * sqrt(1 + (m - 1) * rho)
+
+n   = number of decisions
+m   = decisions per case = 5
+rho = measured intra-case correlation = 0.18–0.21</code></pre>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Split</th><th>Cases</th><th>Decisions</th><th>95% CI half-width near p=0.75</th></tr></thead>
+          <tbody>
+            <tr><td>Small validation</td><td>60</td><td>300</td><td>±6.2 pts</td></tr>
+            <tr><td>TD-DEV</td><td>180</td><td>900</td><td><strong>±3.6 pts</strong></td></tr>
+            <tr><td>Sealed test</td><td>400</td><td>2,000</td><td>±2.3 pts</td></tr>
+            <tr><td>Open-Jev validation</td><td>412</td><td>3,419</td><td>±1.8 pts</td></tr>
+          </tbody>
+        </table></div>
+        <p>The apparent 0.67-point gain sat entirely inside the resolution of the development set. From then on, I compared candidates on identical examples, resampled <strong>cases</strong> rather than rows, and reported the interval of the paired difference.</p>
+      </section>
+
+      <section id="discipline">
+        <div class="eyebrow">Experiment 5</div>
+        <h2>The project changed when I started treating compute like an experimental budget</h2>
+        <p>Data composition had moved performance by tens of points. Many recipe tweaks moved it by less than one. That effect-size mismatch changed how I used the remaining compute.</p>
+        <p>I separated work into a research lane and a confirmation lane. Research could reuse TD-DEV and inspect anything useful. Confirmation froze the model hash, calibration hash, metric code, bootstrap seed, interval method, and pass criteria before touching the sealed test.</p>
+        <p>I also started declaring every run before launch: the question, the one changed factor, the expected effect, the stop condition, and the compute estimate. If a run changed several meaningful variables, it stopped being interpretable.</p>
+      </section>
+
+      <section id="diagnostics">
+        <div class="eyebrow">Experiment 6</div>
+        <h2>The highest-information “experiment” used almost no training compute</h2>
+        <p>A read-only diagnostic pass found four issues that changed my conclusions.</p>
+        <h3>Dropout was active during validation</h3>
+        <p>Metrics were stochastic. Fixing evaluation mode reversed two earlier model selections. Evaluation now fails if the model is in training mode, a requested metric is missing, or prediction and label counts differ.</p>
+        <h3>The input formatter had three defects</h3>
+        <p>I found a leading-space tokenization boundary issue around option text, incorrect default yes/no descriptions, and an allocation problem in the question/options token budget. Earlier affected metrics were marked potentially invalid.</p>
+        <h3>One external comparison was contaminated</h3>
+        <p>An apparent gap disappeared after I found my validation examples in the other model's training data. The rule became simple: compare out-of-sample results only with other out-of-sample results.</p>
+        <h3>Trivial baselines anchored everything else</h3>
+        <pre><code>TD-DEV majority-class accuracy   0.483
+TD-DEV frozen-backbone accuracy  0.283</code></pre>
+      </section>
+
+      <section id="joint">
+        <div class="eyebrow">Experiment 7</div>
+        <h2>The turning point: mix capabilities instead of stacking them</h2>
+        <p>I went back to the pinned base encoder and trained one joint curriculum. J0 used one epoch; J3 used two rotating epochs.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Source</th><th>Rows / epoch</th><th>Role</th></tr></thead>
+          <tbody>
+            <tr><td>Open-Jev</td><td>23,340</td><td>Broad typed decisions</td></tr>
+            <tr><td>Typed decisions</td><td>4,500</td><td>Target distribution</td></tr>
+            <tr><td>Banking77</td><td>3,000</td><td>Many-option routing</td></tr>
+            <tr><td>BoolQ</td><td>3,000</td><td>Binary decision over text</td></tr>
+            <tr><td>UltraFeedback</td><td>4,000</td><td>Ordinal quality</td></tr>
+            <tr><td><strong>Total</strong></td><td><strong>37,840</strong></td><td></td></tr>
+          </tbody>
+        </table></div>
+
+        <figure class="figure">
+          <div class="diagram-title">What “joint” meant in practice</div>
+          <div class="compare">
+            <div class="panel"><strong>Not enough</strong><p>Correct dataset proportions at the epoch level, but long contiguous blocks from one source.</p></div>
+            <div class="mid">→</div>
+            <div class="panel"><strong>What I enforced</strong><p>Every gradient-accumulation window matched source quotas within 5%, otherwise the run aborted.</p></div>
+          </div>
+          <figcaption>A mixed epoch can still behave like sequential training if examples are not interleaved at the optimization-window level.</figcaption>
+        </figure>
+
+        <div class="table-wrap"><table>
+          <thead><tr><th>Metric</th><th>J0 · 1 epoch</th><th>J3 · 2 epochs</th></tr></thead>
+          <tbody>
+            <tr><td>TD-DEV accuracy</td><td>0.716 [0.680, 0.751]</td><td><strong>0.733</strong></td></tr>
+            <tr><td>Banking77 retention</td><td>0.951</td><td><strong>0.968</strong></td></tr>
+            <tr><td>BoolQ retention</td><td>0.790</td><td><strong>0.809</strong></td></tr>
+            <tr><td>UltraFeedback</td><td>under-exposed</td><td><strong>0.464</strong></td></tr>
+            <tr><td>Choice flip rate</td><td>0.037</td><td><strong>0.030</strong></td></tr>
+          </tbody>
+        </table></div>
+        <p>The important result was not only target accuracy. Catastrophic forgetting largely disappeared. Against the sequential foundation, Banking77 moved only −2.8 points and BoolQ improved by 3.9 points.</p>
+      </section>
+
+      <section id="objectives">
+        <div class="eyebrow">Experiment 8</div>
+        <h2>Two reasonable objective changes completely broke training</h2>
+        <p>Once J3 was stable, I tested two ideas that sounded reasonable on paper.</p>
+        <h3>Permutation consistency loss</h3>
+        <p>Typed-decision accuracy fell <strong>21 points</strong>, Open-Jev fell 11, and Banking77 fell 9.5.</p>
+        <h3>Hard/soft cross-entropy blending</h3>
+        <p>Accuracy fell to <strong>0.506</strong> after one epoch, below the pre-declared 0.60 abort floor.</p>
+        <p>The consistency-loss gradient averaged only 0.7% of the task gradient, so its magnitude did not explain the collapse. Gradient clipping did.</p>
+        <pre><code>mean task gradient norm   7.43
+95th percentile           16.47
+clip threshold             1.0</code></pre>
+        <p>Nearly every step was clipped. In that regime, update magnitude is dominated by the threshold, and relatively small auxiliary terms can rotate the update direction enough to alter the trajectory.</p>
+        <div class="callout"><p><strong>Learning:</strong> log gradient norms against the clip threshold. A clipping-dominated training regime can be much more fragile to objective perturbations than the auxiliary loss magnitude suggests.</p></div>
+      </section>
+
+      <section id="plateau">
+        <div class="eyebrow">Experiment 9</div>
+        <h2>Was the model under-trained—or had I hit a ceiling?</h2>
+        <pre><code>held-out accuracy               69–74%
+training accuracy               74.6% → 83.2%
+three-seed probability ensemble 73.8%
+all three seeds agree but wrong 19% of those cases</code></pre>
+        <p>Those numbers did not look like ordinary under-training, so I inspected 240 J3 errors.</p>
+
+        <h3>Some decisions were genuinely ambiguous</h3>
+        <p>About 60% of TD-DEV examples had less than 0.70 reference probability on the gold answer. Accuracy rose from 0.589 below 0.55 reference mass to 0.888 at 0.85 or higher. Among errors, 80% predicted the reference distribution's second choice.</p>
+
+        <h3>Other failures were genuine capability gaps</h3>
+        <p>For numeric questions like “does this invoice match the purchase order?”, accuracy was <strong>0.622</strong> even though the reference labels put <strong>0.875</strong> probability on the gold answer on average. Those rows were not primarily ambiguous—the model was weak at comparing numbers embedded in the state.</p>
+
+        <figure class="figure">
+          <div class="diagram-title">Two kinds of error require two different responses</div>
+          <div class="compare">
+            <div class="panel"><strong>Ambiguous supervision</strong><p>The gold answer itself has low reference mass. Better calibration and soft targets are appropriate.</p></div>
+            <div class="mid">≠</div>
+            <div class="panel"><strong>Capability gap</strong><p>The reference answer is confident, but the model cannot reliably perform the required numerical or multi-step reasoning.</p></div>
+          </div>
+        </figure>
+      </section>
+
+      <section id="nli">
+        <div class="eyebrow">Experiment 10</div>
+        <h2>I tried adding NLI data. It made the target task worse.</h2>
+        <p>I had seen natural-language inference used successfully across many transfer-learning settings, so I tested whether SNLI and MultiNLI would improve binary decisions.</p>
+        <p>BoolQ improved. Open-Jev improved. Typed-decision accuracy fell <strong>3.7 points</strong>, with a paired 95% CI of <strong>−6.4 to −0.9</strong>.</p>
+        <blockquote>A dataset can look semantically related to the skill you want and still be distributionally wrong for the target task.</blockquote>
+      </section>
+
+      <section id="specialization">
+        <div class="eyebrow">Experiment 11</div>
+        <h2>Specialization finally worked once the foundation stopped forgetting</h2>
+        <p>On top of the retention-preserving foundation, a short specialist stage finally produced a clean gain:</p>
+        <pre><code>S1 vs J3 · seed 42 · 900 paired decisions
++5.9 percentage points
+95% CI [+2.6, +9.1]
+
+S1 three-seed mean  0.777
+seed SD             0.016</code></pre>
+        <p>There was still a retention cost: Banking77 moved from 0.968 to 0.952. That is why the final specialist stage remained target-heavy without becoming target-only.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Source</th><th>Rows / epoch</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td>Typed decisions</td><td>4,500</td><td>Target distribution</td></tr>
+            <tr><td>News Category</td><td>1,200</td><td>Topic classification</td></tr>
+            <tr><td>GoEmotions</td><td>1,200</td><td>Emotion classification</td></tr>
+            <tr><td>Prompt injections</td><td>461</td><td>Safety yes/no</td></tr>
+            <tr><td><strong>Total</strong></td><td><strong>7,361</strong></td><td></td></tr>
+          </tbody>
+        </table></div>
+      </section>
+
+      <section id="licensing">
+        <div class="eyebrow">Experiment 12</div>
+        <h2>The strongest model was one I could not release</h2>
+        <p>A broader specialist, S2, became the strongest checkpoint, but some of its data was non-commercial or had unclear licensing terms. That conflicted with my goal of an Apache-2.0 release.</p>
+        <p>I replaced those sources with permissively licensed stand-ins and trained S3.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Metric</th><th>S2</th><th>S3</th></tr></thead>
+          <tbody>
+            <tr><td>TD-DEV</td><td><strong>0.804</strong></td><td>0.788 · 3-seed mean</td></tr>
+            <tr><td>AG News proxy</td><td><strong>0.897</strong></td><td>0.815</td></tr>
+            <tr><td>Emotion proxy</td><td><strong>0.902</strong></td><td>0.548</td></tr>
+            <tr><td>SST-5 proxy</td><td><strong>0.538</strong></td><td>0.297</td></tr>
+          </tbody>
+        </table></div>
+        <p>On the target task, S3 remained statistically consistent with S1: −0.4 points with a 95% CI of −3.0 to +2.1. Its three seeds were 0.787, 0.779, and 0.799. I froze 0.787 because it was the <strong>median</strong>, not the maximum.</p>
+      </section>
+
+      <section id="recipe">
+        <div class="eyebrow">The recipe that survived</div>
+        <h2>The final training strategy</h2>
+
+        <figure class="figure">
+          <div class="diagram-title">Five-stage release path</div>
+          <div class="flow">
+            <div class="node"><b>1 · Joint foundation</b><small>2 epochs · 37,840 rows/epoch · five sources interleaved.</small></div>
+            <div class="node"><b>2 · Specialist</b><small>Up to 4 epochs · 7,361 rows/epoch · early stop on TD-DEV.</small></div>
+            <div class="node"><b>3 · Replication</b><small>Seeds 42, 43, 44 · freeze the median seed.</small></div>
+            <div class="node"><b>4 · Calibration</b><small>Per-primitive temperature scaling with shrinkage · TD-CAL only.</small></div>
+            <div class="node"><b>5 · Confirmation</b><small>One pre-registered evaluation on the sealed test.</small></div>
+          </div>
+        </figure>
+
+        <pre><code>adaptation        full fine-tuning of encoder + decision layers
+optimizer         AdamW
+weight decay      0.01
+learning rates    encoder 2.5e-5 · decision layers 1e-4
+schedule          6% warmup · cosine decay to 1e-6
+clipping          global norm 1.0
+batching          microbatch 8 × accumulation 8 = effective batch 64
+token budget      <= 1,024 tokens per microbatch
+loss              soft-target CE + 0.1 × Brier
+augmentation      Choice options re-permuted every epoch
+mixing invariant  source quotas within each accumulation window ±5%
+selection         TD-DEV accuracy after every epoch</code></pre>
+        <p>None of those settings is especially exotic. The largest gains came from the <strong>structure of the training data and the experiment design</strong>, not from discovering an unusual optimizer.</p>
+      </section>
+
+      <section id="calibration">
+        <div class="eyebrow">Probability quality</div>
+        <h2>Calibration was a separate development stage</h2>
+        <p>For a decision model, probabilities are part of the API. I therefore gave calibration its own data, parameters, artifact, and hash rather than treating it as reporting polish.</p>
+        <p>Unconstrained per-primitive temperatures were below 1:</p>
+        <pre><code>Choice  0.60
+Noul    0.39
+Score   0.41</code></pre>
+        <p>Since temperature scaling uses <code>z / T</code>, values below one sharpen the distribution. The raw model was underconfident, which is consistent with soft-target training on ambiguous supervision.</p>
+
+        <h3>A trade-off between ECE and teacher Brier</h3>
+        <p>With only 300 calibration decisions, I shrank each fitted log-temperature toward zero. The shrinkage strength was chosen by a pre-declared rule that required both ECE and teacher Brier to remain below 0.10.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Alpha</th><th>ECE</th><th>Teacher Brier</th><th>Coverage @ 0.90</th></tr></thead>
+          <tbody>
+            <tr><td>0.0</td><td>0.146</td><td><strong>0.057</strong></td><td>0.103</td></tr>
+            <tr><td>0.3</td><td>0.106</td><td>0.066</td><td>0.143</td></tr>
+            <tr><td><strong>0.5</strong></td><td><strong>0.070</strong></td><td><strong>0.078</strong></td><td>0.180</td></tr>
+            <tr><td>0.8</td><td>0.054</td><td>0.102</td><td>0.253</td></tr>
+            <tr><td>1.0</td><td><strong>0.053</strong></td><td>0.121</td><td><strong>0.330</strong></td></tr>
+          </tbody>
+        </table></div>
+        <p>The full fit minimized ECE but violated the teacher-Brier target. Alpha 0.5 satisfied both. The selected temperatures were Choice 0.78, Noul 0.62, and Score 0.64.</p>
+
+        <figure class="figure">
+          <div class="diagram-title">Selective prediction after calibration</div>
+          <div class="metric-bars">
+            <div class="metric-row"><span>Choice · 15.7% coverage</span><div class="bar"><i style="--value:98.9%"></i></div><strong>98.9%</strong></div>
+            <div class="metric-row"><span>Noul · 43.0% coverage</span><div class="bar"><i style="--value:98.4%"></i></div><strong>98.4%</strong></div>
+            <div class="metric-row"><span>Score · 10.3% coverage</span><div class="bar"><i style="--value:98.8%"></i></div><strong>98.8%</strong></div>
+            <div class="metric-row"><span>Overall · 21.7% coverage</span><div class="bar"><i style="--value:98.6%"></i></div><strong>98.6%</strong></div>
+          </div>
+          <figcaption>Bar length shows accuracy inside the high-confidence slice; the label shows how much of the data that slice covers.</figcaption>
+        </figure>
+
+        <p>On the sealed test, ECE fell from <strong>0.130 to 0.054</strong> without changing argmax accuracy. Operationally, the useful quantity is not “confidence” alone. It is <strong>coverage at a threshold together with empirical accuracy on the covered slice</strong>.</p>
+      </section>
+
+      <section id="results">
+        <div class="eyebrow">Confirmation</div>
+        <h2>The sealed test result</h2>
+        <p>The release candidate was frozen before evaluation. The sealed test contained 400 cases and 2,000 decisions, evaluated once under the pre-registered contract with case-clustered bootstrap.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Primitive</th><th>Accuracy</th><th>95% CI</th><th>ECE</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Overall</strong></td><td><strong>0.771</strong></td><td><strong>[0.750, 0.792]</strong></td><td><strong>0.054</strong></td></tr>
+            <tr><td>Choice</td><td>0.745</td><td>[0.708, 0.780]</td><td>0.083</td></tr>
+            <tr><td>Noul</td><td><strong>0.842</strong></td><td>[0.809, 0.872]</td><td><strong>0.030</strong></td></tr>
+            <tr><td>Score</td><td>0.739</td><td>[0.709, 0.769]</td><td>0.062</td></tr>
+          </tbody>
+        </table></div>
+
+        <h3>Additional one-time benchmarks</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Benchmark</th><th>Setup</th><th>Accuracy</th><th>95% CI</th></tr></thead>
+          <tbody>
+            <tr><td>Prompt injection</td><td>yes/no · 116 rows</td><td><strong>0.983</strong></td><td>[0.957, 1.000]</td></tr>
+            <tr><td>Banking77</td><td>2–10 options · 21,560 rows</td><td><strong>0.963</strong></td><td>[0.959, 0.967]</td></tr>
+            <tr><td>AG News</td><td>4 options · 600 rows</td><td>0.800</td><td>[0.768, 0.832]</td></tr>
+            <tr><td>BoolQ</td><td>yes/no · 3,270 rows</td><td>0.793</td><td>[0.779, 0.808]</td></tr>
+            <tr><td>Emotion</td><td>6 options · 600 rows</td><td>0.535</td><td>[0.495, 0.575]</td></tr>
+            <tr><td>SST-5</td><td>5-level score · 600 rows</td><td>0.320</td><td>[0.282, 0.358]</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+
+      <section id="inference">
+        <div class="eyebrow">Serving</div>
+        <h2>Training is only half the system</h2>
+        <p>I benchmarked the actual release runtime using MLX in float16 on the same M5 Pro. Each shape used 1,000 iterations after warmup in one process.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Questions / request</th><th>P50</th><th>P95</th><th>Peak memory</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td><strong>10.1 ms</strong></td><td>10.3 ms</td><td>1.91 GB</td></tr>
+            <tr><td>5</td><td>35.8 ms</td><td>36.8 ms</td><td>2.43 GB</td></tr>
+            <tr><td>10</td><td>66.7 ms</td><td>67.4 ms</td><td>2.50 GB</td></tr>
+            <tr><td>50</td><td>335.0 ms</td><td>337.1 ms</td><td>2.58 GB</td></tr>
+          </tbody>
+        </table></div>
+        <p>P95/P50 stayed under 1.03 at every tested shape. Predictability matters when a model sits in a synchronous decision path.</p>
+
+        <h3>Two serving bugs were hiding in plain sight</h3>
+        <p>The release runtime was loading float32 weights because dtype conversion happened before loading instead of after. It also padded inputs to multiples of 16 even on paths that did not benefit from compiled-graph padding. Fixing both brought single-question P50 to 10.1 ms with no prediction changes.</p>
+
+        <h3>Backend parity</h3>
+        <pre><code>checkpoint vs MLX release   100% argmax agreement
+MLX vs PyTorch CPU          100%
+MLX vs PyTorch MPS           99.9%</code></pre>
+        <p>Strict 1e-4 numerical parity holds on CPU. For deployment, numerical parity is useful; <strong>decision parity is essential</strong>.</p>
+      </section>
+
+      <section id="limits">
+        <div class="eyebrow">Boundary of the design</div>
+        <h2>Where the model still fails—and how I knew the encoder had reached its ceiling</h2>
+        <h3>Option-order sensitivity</h3>
+        <p><strong>5.8%</strong> of Choice predictions change when options are permuted, against a 5% goal. The explicit invariance objective I tried destabilized optimization, so production should keep option order stable or average across orderings where latency allows.</p>
+        <h3>Fine-grained affect remains weak</h3>
+        <p>Emotion classification and five-level sentiment remain weak because the permissively licensed substitute datasets transferred poorly.</p>
+        <h3>Numeric and multi-step reasoning remain weak</h3>
+        <p>This is the more fundamental limitation. The model struggles when a decision requires comparing multiple numbers, applying multi-step transformations, or reasoning across distant evidence.</p>
+        <h3>The interface itself has limits</h3>
+        <pre><code>context    512 tokens
+options    2–10
+modality   text only</code></pre>
+
+        <p>Several independent signals pointed toward a backbone ceiling: held-out accuracy plateaued while training accuracy kept rising; more epochs did not reliably help; three seeds often agreed on the same wrong answers; numeric comparisons remained weak; and 5.1% of Open-Jev validation states were truncated.</p>
+
+        <h3>When a larger LLM backbone becomes the better choice</h3>
+        <p>A larger instruction-tuned LLM brings more world knowledge, arithmetic and multi-step reasoning, longer context, and stronger instruction-following priors. It can also be adapted with LoRA or other parameter-efficient methods that reduce representation drift.</p>
+        <p>But a larger backbone does not require returning to free-form generation. The interface can remain <strong>typed question → constrained scores → normalized probabilities</strong>.</p>
+
+        <div class="compare figure">
+          <div class="panel"><strong>Prefer a small encoder when</strong><p>Latency and throughput are critical, inputs are short, outputs are bounded, evidence is local, and calibrated probabilities matter.</p></div>
+          <div class="mid">↔</div>
+          <div class="panel"><strong>Prefer a larger LLM when</strong><p>World knowledge, numeric reasoning, multi-step reasoning, long context, or highly variable schemas dominate the workload.</p></div>
+        </div>
+        <blockquote>What is the smallest backbone that puts enough capability underneath the decision interface for this workload?</blockquote>
+      </section>
+
+      <section id="lessons">
+        <div class="eyebrow">What survived 46 runs</div>
+        <h2>What 46 experiments taught me</h2>
+
+        <h3>Data composition beats cleverness surprisingly often</h3>
+        <p>My largest improvement did not come from a new optimizer, a novel loss, more epochs, or an ensemble. It came from putting the right data into the gradient stream in the right proportions.</p>
+
+        <h3>Full fine-tuning forgets what disappears</h3>
+        <p>If the final model needs a capability, keep showing it examples of that capability. Epoch-level proportions are not enough; inspect what the optimizer actually sees between updates.</p>
+
+        <h3>Measurement resolution should constrain your claims</h3>
+        <pre><code>How large is the paired uncertainty?
+How large is seed variance?
+Can the evaluation set actually resolve the improvement?</code></pre>
+        <p>A small decimal difference in a table is not automatically evidence.</p>
+
+        <h3>Negative experiments are valuable when they eliminate hypotheses</h3>
+        <p>Sequential training failed. Permutation consistency failed. Hard/soft CE blending failed. NLI transfer failed. Each failure made the search space smaller.</p>
+
+        <h3>Calibration deserves its own data</h3>
+        <p>For constrained decisions, probabilities influence automation thresholds, review routing, escalation, and trust. Calibration is a modeling stage, not a presentation detail.</p>
+
+        <h3>Training and inference engineering are part of the same system</h3>
+        <p>A dtype-loading bug or unnecessary padding can erase a meaningful share of the latency advantage created by choosing a smaller architecture.</p>
+
+        <h3>Open-source work dramatically shortens the learning curve—but does not remove the need to validate assumptions</h3>
+        <p>Almost every part of this project benefited from work other people made public: pretrained backbones, datasets, training recipes, calibration techniques, MLX examples, PyTorch implementations, statistical methods, inference patterns, and benchmark code.</p>
+        <p>That made it possible for one person with one laptop to explore a problem that would otherwise have required far more infrastructure. But copying a technique because it worked elsewhere was never enough. NLI transfer looked reasonable and hurt the target task. Consistency regularization looked reasonable and collapsed training. Sequential specialization looked reasonable and caused forgetting.</p>
+        <blockquote>Open-source work gave me a much better starting point. The experiments still had to decide what survived.</blockquote>
+
+        <h3>Eventually, the backbone becomes the bottleneck</h3>
+        <p>When held-out performance plateaus, training performance keeps improving, multiple seeds make the same mistakes, ensembling does not help, and error analysis identifies systematic reasoning gaps, another optimizer experiment may no longer be the highest-value next step.</p>
+
+        <h3>Closing thought</h3>
+        <p>Nirnaya-Flash was built by one person, on one personal laptop, largely by learning from open-source work and repeatedly testing which ideas held up on the problem in front of me.</p>
+        <p>The final model did not come from one magical loss function or hyperparameter. It came from progressively tightening the <strong>experimental system around the model</strong>.</p>
+        <blockquote>You can learn a surprising amount with modest hardware when the experiments are designed carefully, the evidence is treated seriously, and you are willing to learn from the open-source work that already exists rather than starting from a blank page.</blockquote>
+      </section>
+
+      <section id="reproduce">
+        <div class="eyebrow">Open release</div>
+        <h2>Reproducing Nirnaya-Flash</h2>
+        <p>Nirnaya-Flash is released under Apache-2.0.</p>
+        <a class="hf-card" href="https://huggingface.co/9337aaric/Nirnaya-Flash" target="_blank" rel="noopener noreferrer" aria-label="Open Nirnaya-Flash on Hugging Face">
+          <div class="hf-card-head">
+            <span class="hf-mark" aria-hidden="true">HF</span>
+            <div class="hf-title">
+              <span class="hf-owner">9337aaric /</span>
+              <span class="hf-name">Nirnaya-Flash</span>
+            </div>
+            <span class="hf-license">apache-2.0</span>
+          </div>
+          <p class="hf-desc">Calibrated, non-autoregressive decision model for typed Choice, Noul and Score questions, fine-tuned from ModernBERT-large.</p>
+          <ul class="hf-tags" aria-label="Model tags">
+            <li>Text Classification</li>
+            <li>Transformers</li>
+            <li>MLX</li>
+            <li>Safetensors</li>
+            <li>custom_code</li>
+            <li>English</li>
+          </ul>
+          <dl class="hf-stats">
+            <div><dt>Parameters</dt><dd>421M</dd></div>
+            <div><dt>Weights</dt><dd>float16 · ~0.8 GB</dd></div>
+            <div><dt>Test accuracy</dt><dd>77.1%</dd></div>
+            <div><dt>P50 latency</dt><dd>10.1 ms</dd></div>
+          </dl>
+          <div class="hf-foot">
+            <span>Base model: answerdotai/ModernBERT-large</span>
+            <span class="hf-cta">View on Hugging Face →</span>
+          </div>
+        </a>
+        <p><strong>MLX installation</strong></p>
+        <pre><code>pip install nirnaya</code></pre>
+        <p><strong>PyTorch installation</strong></p>
+        <pre><code>pip install "nirnaya[torch]"</code></pre>
+        <p>The release includes the model weights, calibration parameters, and serving implementation required to reproduce the inference path described in this article.</p>
+      </section>
+
+      <footer class="site-footer">
+        <div class="author-card">
+          <div class="author-avatar" aria-hidden="true">BM</div>
+          <div>
+            <div class="eyebrow">Author</div>
+            <p class="author-name">Biswajit Mohapatro</p>
+            <p class="author-role">AI Engineer</p>
+            <p class="author-bio">Designed, trained, evaluated and released Nirnaya-Flash independently, on a personal Apple M5 Pro laptop.</p>
+          </div>
+        </div>
+        <dl class="footer-meta">
+          <div><dt>Model</dt><dd><a href="https://huggingface.co/9337aaric/Nirnaya-Flash">Hugging Face</a> · <a href="https://pypi.org/project/nirnaya/">PyPI</a></dd></div>
+          <div><dt>License</dt><dd>Apache-2.0</dd></div>
+          <div><dt>Published</dt><dd><time datetime="2026-10-06">October 6, 2026</time></dd></div>
+          <div><dt>Evidence</dt><dd>Sealed-test numbers come from one pre-registered evaluation with case-clustered 95% intervals.</dd></div>
+        </dl>
+        <p class="footer-fine">Independent personal project; views are my own. This page is static HTML and CSS with a small amount of vanilla JavaScript.</p>
+      </footer>
+    </article>
+
+    <aside class="right-rail" aria-label="Reading note">
+      <div class="note-card">
+        <b>How to read this</b>
+        <p>The left rail is the experiment timeline. If you only want the final method, jump to <a href="#recipe">Final recipe</a>. If you care about why the recipe looks that way, follow the experiments in order.</p>
+      </div>
+    </aside>
+  </main>
+
+  <script src="script.js"></script>
+</body>
+</html>

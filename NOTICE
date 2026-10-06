@@ -1,0 +1,52 @@
+Nirnaya attribution notice
+
+Nirnaya-Flash code and weights are released under the Apache License, Version 2.0 (see LICENSE).
+
+The weights derive from the following model:
+
+1. ModernBERT (Apache-2.0)
+   Source: answerdotai/ModernBERT-large
+   Revision: 45bb4654a4d5aaff24dd11d4781fa46d39bf8c13
+   Use: encoder architecture and pretrained encoder weights.
+
+The weights were trained on the following datasets. Each remains under its own license.
+
+2. Typed Decisions (Apache-2.0)
+   Source: LocalLLaMA/typed-decisions @ c76749ec58bd8c3d2ea706b31c333a9059c38f90
+   Attribution: Typed Decisions by LocalLLaMA.
+
+3. Open-Jev (CC0-1.0)
+   Source: ZefanCai/Open-Jev @ c67699e13d0ae25e35b77165a4b6b079bedc8aba
+   Attribution: Open-Jev typed decision datasets by Zefan Cai (customer-control-v1 excluded).
+
+4. BANKING77 (CC-BY-4.0)
+   Source: PolyAI/banking77 @ 90d4e2ee5521c04fc1488f065b8b083658768c57
+   Attribution: BANKING77 by PolyAI; Casanueva et al. (2020), "Efficient Intent Detection with
+   Dual Sentence Encoders".
+
+5. BoolQ (CC-BY-SA-3.0)
+   Source: google/boolq @ 35b264d03638db9f4ce671b711558bf7ff0f80d5
+   Attribution: BoolQ by Google Research; Clark et al. (2019), "BoolQ: Exploring the Surprising
+   Difficulty of Natural Yes/No Questions". The dataset itself is not redistributed here.
+
+6. UltraFeedback (MIT)
+   Source: openbmb/UltraFeedback @ 40b436560ca83a8dba36114c22ab3c66e43f6d5e
+   Attribution: UltraFeedback by OpenBMB; Cui et al. (2023).
+
+7. GoEmotions (Apache-2.0)
+   Source: google-research-datasets/go_emotions @ add492243ff905527e67aeb8b80c082af02207c3
+   Attribution: GoEmotions by Demszky et al. (ACL 2020), Google Research.
+
+8. News Category Dataset (CC-BY-4.0)
+   Source: heegyu/news-category-dataset @ 304a05a55bc6abc0446d8fae0d0771716b6a271a
+   Attribution: News Category Dataset by Rishabh Misra (2022), arXiv:2209.11429; HuffPost
+   headlines and short descriptions.
+
+9. Prompt Injections (Apache-2.0)
+   Source: deepset/prompt-injections @ 4f61ecb038e9c3fb77e21034b22511b523772cdd
+   Attribution: prompt-injections dataset by deepset.
+
+Evaluation-only data (AG News, DAIR Emotion, SST-5, and the test splits above) was used to
+measure the model and was never used to train the released weights.
+
+This notice does not replace the original licenses of the works listed above.
